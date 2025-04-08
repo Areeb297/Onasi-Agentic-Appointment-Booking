@@ -9,7 +9,7 @@ import websockets          # For WebSocket client functionality
 from fastapi import FastAPI, WebSocket, Request           # Core FastAPI components
 from fastapi.responses import HTMLResponse # type: ignore # For returning HTML content
 from fastapi.websockets import WebSocketDisconnect        # Exception for WebSocket disconnections
-
+from twilio.rest import Client
 # Twilio SDK for building TwiML responses
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream  # Twilio voice response components
 
@@ -543,6 +543,28 @@ async def send_session_update(openai_ws):
     
     # Initialize conversation with patient-specific greeting
     await send_initial_conversation_item(openai_ws, patient_details)
+
+
+@app.get("/make-call")
+async def trigger_call():
+    """Endpoint to initiate outbound call from Twilio to your phone"""
+    # Load credentials from .env
+    TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+    TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+    YOUR_NUMBER = os.getenv('YOUR_PHONE_NUMBER')  # Your real phone number (+1xxx...)
+    TWILIO_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')  # Your Twilio number
+    
+    # Initialize Twilio client
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    
+    # Start call
+    call = client.calls.create(
+        url=f'https://{os.getenv("HOSTNAME")}/incoming-call',  # Uses existing endpoint
+        to=YOUR_NUMBER,
+        from_=TWILIO_NUMBER
+    )
+    
+    return {"status": "Call initiated!", "call_sid": call.sid}
 
 # === App Runner ===
 if __name__ == "__main__":
