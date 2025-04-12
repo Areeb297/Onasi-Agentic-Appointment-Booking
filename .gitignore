@@ -1,8 +1,5 @@
 # Environment variables and secrets
 .env
-.env.local
-.env.*
-*.env
 config.json
 secrets.json
 
