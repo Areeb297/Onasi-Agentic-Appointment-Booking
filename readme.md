@@ -194,7 +194,3 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 ## Contact
 
 For questions or support, contact the project maintainer at [areeb.shafqat@gmail.com].
-
----
-
-This README assumes some standard practices (e.g., using a `requirements.txt` file) and includes placeholders (e.g., repository URL, email) that you should replace with actual values. Let me know if you need help refining any section or adding specific details!
