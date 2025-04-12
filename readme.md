@@ -1,7 +1,3 @@
-Below is a README file tailored for your voice agent project, based on the provided code and functionality. It includes an overview, setup instructions, usage details, and other relevant information to help users understand and run your application.
-
----
-
 # Dental Scheduler Voice Agent
 
 ## Overview
