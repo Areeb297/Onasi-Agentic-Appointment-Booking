@@ -16,17 +16,30 @@ async def initialize_openai_session(openai_ws, db_conn):
     session_update = {
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500},
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 600
+            },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": "alloy",
             "instructions": (
                 "You are a helpful AI receptionist working at Allballa Dental Center. "
                 "Ignore any default greetings. Use the provided custom greeting exactly. "
-                "When confirming appointments, **always** use one of these exact phrases:\n"
+                
+                "**CRITICAL RULES for Availability & Booking:**\n"
+                "1. You have been provided with a list of currently available appointment slots. Refer **ONLY** to this list when discussing or offering appointments. Do not invent slots or dates.\n"
+                "2. If the provided list of available slots is EMPTY, you **MUST** inform the user clearly that there are currently no openings and suggest calling back later. Do not offer to schedule anything.\n"
+                "3. If the user asks for a date/time that is NOT on the provided availability list, you **MUST** state that the specific time is unavailable. Only suggest alternatives *if* there are other slots available on the provided list. If the list is empty, reiterate that nothing is available.\n"
+                "4. **NEVER** use confirmation phrases ('I have scheduled...', 'Your appointment is confirmed...', 'Successfully booked...') unless you have first identified a specific, available slot **from the provided list** and the user has explicitly agreed to book that exact slot.\n"
+                
+                "When you have successfully confirmed an available slot with the user and are about to finalize the booking, you MUST use **exactly one** of the following phrases and nothing else immediately after:\n" 
                 "- 'I have scheduled your appointment for [DATE/TIME]'\n"
                 "- 'Your appointment is confirmed for [DATE/TIME]'\n"
                 "- 'Successfully booked for [DATE/TIME]'\n"
+                "Replace [DATE/TIME] with the correct details. Do not add extra words before or after these specific phrases when confirming the final booking.\n" 
                 "ALWAYS:\n"
                 "1. State dates as 'March 30th, 2024 from 3:00 PM to 4:00 PM'\n"
                 "2. Include both date and time ranges\n"
@@ -105,12 +118,21 @@ async def send_initial_conversation_item(openai_ws, patient_details):
     logger.info("Sent system message")
     print("System message sent")
     
+    # Check availability and construct initial greeting
+    available_slots_list = patient_details.get("availability", [])
+    if not available_slots_list:
+        availability_message = "I see that we currently have no open appointment slots."
+    else:
+        slots_to_mention = ', '.join([slot['display'] for slot in available_slots_list[:3]])
+        availability_message = f"Our available slots currently include: {slots_to_mention}."
+
     initial_text = (
         f"Hello there {name}! This is AI Dental Assistant OnasiHelper calling from Allballa Dental Center. "
+        f"Would you prefer to continue in English or Arabic? " # Language question
         f"{history_context}"
         f"I'm reaching out regarding {action}. "
         f"Your next follow-up appointment is due, and I'd like to schedule it for you. "
-        f"Do you have a preferred date and time? Our available slots are: {', '.join([slot['display'] for slot in patient_details['availability'][:3]])}"
+        f"{availability_message} Do you have a preferred date and time, or would you like to hear more options?"
     )
     
     initial_conversation_item = {
