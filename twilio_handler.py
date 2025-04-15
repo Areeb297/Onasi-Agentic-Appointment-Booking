@@ -20,7 +20,7 @@ from datetime import datetime
 import logging
 from config import load_clean_config
 from database import save_appointment, get_connection, get_patient_by_id
-from openai_handler import initialize_openai_session
+from openai_handler import initialize_openai_session, translate_and_extract_appointment_info
 
 logger = logging.getLogger(__name__)
 config = load_clean_config()
@@ -61,9 +61,7 @@ async def handle_media_stream(websocket: WebSocket):
         "is_listening": True,  # Ensure listening state
         "user_transcript": "",  # Store user's speech transcript
         "last_user_transcript": "",  # Store previous user speech for comparison
-        "potential_date_mentioned": False,  # Flag to track if a date might have been mentioned
-        "appointment_confirmed": False,  # Track if appointment has been confirmed
-        "pending_slot": None  # Store pending slot for booking
+        "appointment_confirmed": False,
     }
     
     # Get a connection for initial patient data loading
@@ -80,6 +78,8 @@ async def handle_media_stream(websocket: WebSocket):
         ) as openai_ws:
             logger.info("Connected to OpenAI WebSocket")
             patient_details = await initialize_openai_session(openai_ws, db_conn)
+            logger.info(f"Value returned by initialize_openai_session: {patient_details}")
+            logger.info(f"Type returned by initialize_openai_session: {type(patient_details)}")
             logger.info("OpenAI session initialized with patient: %s", patient_details["name"])
             
             # Close initial connection after loading patient data
@@ -140,369 +140,248 @@ async def handle_media_stream(websocket: WebSocket):
             
             async def send_to_twilio():
                 nonlocal state
-                logger.info("Starting send_to_twilio")
+                logger.info("Starting send_to_twilio listening loop.")
                 try:
-                    async for message in openai_ws:
-                        response = json.loads(message)
-                        
-                        # Handle user speech transcript
-                        if response.get("type") == "input_audio_buffer.transcript.delta":
-                            user_speech = response.get("transcript", "")
-                            state["user_transcript"] += user_speech
-                            logger.info("User speech transcript delta: %s", user_speech)
-                            
-                            # Check for potential date mentions in user speech
-                            if any(keyword in state["user_transcript"].lower() for keyword in 
-                                  ["monday", "tuesday", "wednesday", "thursday", "friday", 
-                                   "saturday", "sunday", "tomorrow", "next week", "january", 
-                                   "february", "march", "april", "may", "june", "july", 
-                                   "august", "september", "october", "november", "december"]):
-                                state["potential_date_mentioned"] = True
-                                logger.info("Potential date detected in user speech: %s", state["user_transcript"])
-                        
-                        # When user finishes speaking, process the complete transcript
-                        elif response.get("type") == "input_audio_buffer.transcript.done":
-                            if state["user_transcript"] and state["user_transcript"] != state["last_user_transcript"]:
-                                logger.info("Complete user transcript: %s", state["user_transcript"])
-                                
-                                # Process potential appointment date/time
-                                if state["potential_date_mentioned"]:
-                                    await process_appointment_request(state["user_transcript"], patient_details, openai_ws, websocket, state)
-                                
-                                # Save current transcript as last transcript
-                                state["last_user_transcript"] = state["user_transcript"]
-                                state["user_transcript"] = ""
-                                state["potential_date_mentioned"] = False
-                        
-                        # Handle AI audio response
-                        elif response.get("type") == "response.audio.delta" and "delta" in response:
-                            audio_payload = base64.b64encode(
-                                base64.b64decode(response["delta"])
-                            ).decode("utf-8")
-                            await websocket.send_json({
-                                "event": "media",
-                                "streamSid": state["stream_sid"],
-                                "media": {"payload": audio_payload}
-                            })
-                            logger.debug("Sent audio to Twilio")
-                            if state["response_start_timestamp_twilio"] is None:
-                                state["response_start_timestamp_twilio"] = state["latest_media_timestamp"]
-                            if response.get("item_id"):
-                                state["last_assistant_item"] = response["item_id"]
-                            await send_mark(websocket, state["stream_sid"])
-                        
-                        # Handle AI text transcript
-                        elif response.get("type") == "response.audio_transcript.delta":
-                            # logger.info("Received raw response.audio_transcript.delta object: %s", json.dumps(response)) # Removed raw log
-                            # Original logic
-                            transcript_delta = response.get("transcript", "")
-                            state["transcript_buffer"] += transcript_delta
-                            # logger.info("Received AI transcript delta: %s", transcript_delta) # Removed info log
-                        
-                        # Process complete AI transcript
-                        elif response.get("type") == "response.audio_transcript.done":
-                            # logger.info("Received raw response.audio_transcript.done object: %s", json.dumps(response)) # Removed raw log
-                            # Original logic FIX: Use transcript from the done event directly
-                            state["accumulated_text"] = response.get("transcript", state["transcript_buffer"]) # Prioritize transcript from done event
-                            logger.info("Full transcript accumulated: %s", state["accumulated_text"])
-                            state["transcript_buffer"] = "" # Reset buffer for next utterance
-                            
-                            # Check if AI response indicates appointment confirmation
-                            if not state["appointment_confirmed"]:
-                                await check_for_appointment_confirmation(state["accumulated_text"], patient_details, openai_ws, websocket, state)
-                        
-                        # Handle AI response completion
-                        elif response.get("type") == "response.done":
-                            full_text = state["accumulated_text"].lower()
-                            logger.info("AI response text finalized: %s", full_text)
-
-                            # --- Check for Hangup Trigger ---
-                            triggered_hangup = False
-                            for phrase in AI_GOODBYE_PHRASES:
-                                if phrase in full_text:
-                                    logger.info(f"Detected AI goodbye phrase: '{phrase}'. Waiting 3s before triggering call end.")
-                                    await asyncio.sleep(3) # Add 3-second delay
-                                    try:
-                                        if openai_ws.open:
-                                            await openai_ws.close()
-                                            logger.info("Closed OpenAI WebSocket.")
-                                        await websocket.close() # Just attempt to close
-                                        logger.info("Closed Twilio WebSocket.")
-                                        triggered_hangup = True
-                                        break # Exit phrase loop
-                                    except Exception as close_err:
-                                        logger.error(f"Error closing websockets: {close_err}")
-                            
-                            if triggered_hangup:
-                                return # Exit send_to_twilio loop
-                            # --- End Hangup Trigger Check ---
-
-                            # Reset accumulated text for next response only if not hanging up
-                            state["accumulated_text"] = ""
-                        
-                        # Handle user speech detection
-                        elif response.get("type") == "input_audio_buffer.speech_started":
-                            logger.info("User speech detected at timestamp %d", state["latest_media_timestamp"])
-                            if state["last_assistant_item"]:
-                                await handle_interruption(openai_ws, websocket, state)
-                        
-                        # Handle user speech completion
-                        elif response.get("type") == "input_audio_buffer.speech_finished":
-                            logger.info("User speech finished, processing")
-                            state["is_listening"] = True
-                
-                except Exception as e:
-                    logger.error("Error in send_to_twilio: %s", str(e))
-                    await send_text(openai_ws, "Sorry, I hit a snag. Let's try again.")
-                    raise
-                finally:
-                    logger.info("send_to_twilio ended")
-            
-            async def process_appointment_request(transcript, patient_details, openai_ws, twilio_ws, state):
-                """Process user's appointment request from transcript."""
-                logger.info("Processing potential appointment request: %s", transcript)
-                
-                # Extract date information using multiple patterns
-                date_patterns = [
-                    # Standard date formats
-                    r'(\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})',
-                    r'((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})',
-                    r'(\d{4}-\d{1,2}-\d{1,2})',
-                    r'(\d{1,2}/\d{1,2}/\d{4})',
-                    r'(\d{1,2}-\d{1,2}-\d{4})',
-                    
-                    # Day references
-                    r'(next\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))',
-                    r'(this\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))',
-                    r'(tomorrow)',
-                    r'(the\s+day\s+after\s+tomorrow)',
-                    
-                    # Month and day without year
-                    r'((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?)',
-                    r'(\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December))',
-                    
-                    # Numeric dates without year
-                    r'(\d{1,2}/\d{1,2})',
-                    r'(\d{1,2}-\d{1,2})'
-                ]
-                
-                # Try to extract date using patterns
-                extracted_date = None
-                for pattern in date_patterns:
-                    match = re.search(pattern, transcript, re.IGNORECASE)
-                    if match:
-                        extracted_date = match.group(1)
-                        logger.info("Extracted date using pattern: %s", extracted_date)
-                        break
-                
-                if not extracted_date:
-                    logger.info("No specific date pattern found in transcript")
-                    return
-                
-                # Try to parse the extracted date
-                try:
-                    # Handle relative dates
-                    current_date = datetime.now()
-                    if "tomorrow" in extracted_date.lower():
-                        parsed_date = current_date.replace(day=current_date.day + 1)
-                    elif "next" in extracted_date.lower():
-                        # Simple approximation - add 7 days for next week
-                        parsed_date = current_date.replace(day=current_date.day + 7)
-                    elif "this" in extracted_date.lower():
-                        # Simple approximation - add 2-3 days for this week
-                        parsed_date = current_date.replace(day=current_date.day + 3)
-                    elif "day after tomorrow" in extracted_date.lower():
-                        parsed_date = current_date.replace(day=current_date.day + 2)
-                    else:
-                        # For dates without year, add current year
-                        if not re.search(r'\d{4}', extracted_date):
-                            extracted_date += f", {current_date.year}"
-                        
-                        parsed_date = parser.parse(extracted_date)
-                    
-                    normalized_date = parsed_date.strftime("%Y-%m-%d")
-                    logger.info("Normalized date: %s", normalized_date)
-                    
-                    # Check if this date is in available slots
-                    all_available_slots = patient_details.get("availability", []) # Get overall list
-                    slots_on_date = [s for s in all_available_slots if s["date"] == normalized_date]
-                    
-                    if slots_on_date:
-                        # Found matching slots for the specific date
-                        slot_descriptions = "\n".join([f"- {s['start_time']} to {s['end_time']}" for s in slots_on_date])
-                        confirmation_message = (
-                            f"Great! I found available slots on {normalized_date}:\n{slot_descriptions}\n"
-                            f"Would you like me to book the {slots_on_date[0]['start_time']} slot for you?"
-                        )
-                        
-                        state["pending_slot"] = slots_on_date[0]
-                        print(f"DEBUG: Set pending_slot to {slots_on_date[0]}")
-                        await send_text(openai_ws, confirmation_message)
-                    else:
-                        # No slots available on that specific date
-                        if not all_available_slots: # Check if there are ANY slots at all
-                            alternative_msg = (
-                                f"I'm sorry, we don't have any openings on {normalized_date}, and it looks like "
-                                f"there are currently no available appointment slots in our system at all. "
-                                f"Please check back later."
-                            )
-                        else:
-                            # Slots exist, just not on the requested date
-                            alternative_dates = list(set([s["date"] for s in all_available_slots]))[:3]
-                            alternative_msg = (
-                                f"I'm sorry, but there are no available slots on {normalized_date}. "
-                                f"We do have openings on other dates like: {', '.join(alternative_dates)}. "
-                                f"Would any of those work for you?"
-                            )
-                        await send_text(openai_ws, alternative_msg)
-                
-                except Exception as e:
-                    logger.error("Error processing date: %s", str(e))
-                    await send_text(openai_ws, "I'm having trouble understanding that date. Could you please specify the date again?")
-            
-            async def check_for_appointment_confirmation(transcript, patient_details, openai_ws, twilio_ws, state):
-                """Check if AI response indicates appointment confirmation and process it."""
-                transcript_lower = transcript.lower()
-                
-                # Debug logging
-                print(f"DEBUG: Checking for appointment confirmation in: {transcript_lower}")
-                logger.info(f"Checking AI transcript for confirmation: '{transcript_lower}'")
-                with open("confirmation_debug.log", "a") as f:
-                    f.write(f"{datetime.now()}: Checking transcript: {transcript_lower}\\n")
-
-                # Check for confirmation phrases in AI response
-                scheduling_phrases = [
-                    "scheduled your appointment",
-                    "booked your appointment",
-                    "confirmed your appointment",
-                    "successfully scheduled",
-                    "appointment is set for",
-                    "i have scheduled your appointment for",
-                    "your appointment is confirmed for",
-                    "successfully booked for"
-                ]
-
-                # Debug logging for phrases
-                found_phrase = False
-                for phrase in scheduling_phrases:
-                    if phrase in transcript_lower:
-                        print(f"DEBUG: Found confirmation phrase: {phrase}")
-                        logger.info(f"Found confirmation phrase: '{phrase}'")
-                        found_phrase = True
-                        with open("confirmation_debug.log", "a") as f:
-                            f.write(f"{datetime.now()}: Found phrase: {phrase}\\n")
-                
-                if found_phrase:
-                    logger.info("Detected scheduling confirmation in AI response: %s", transcript)
-                    
-                    # Check if we have a pending slot from user request
-                    logger.info(f"Current pending_slot state: {state.get('pending_slot')}")
-                    if "pending_slot" in state and state["pending_slot"]:
-                        logger.info("Using pending slot for confirmation: %s", state["pending_slot"])
-                        confirmed_slot = state["pending_slot"]
-                        
-                        # Save the appointment using the robust database module
+                    # Keep listening as long as the OpenAI WebSocket is open
+                    while openai_ws.open:
                         try:
-                            logger.info(f"Calling save_appointment with slot_id: {confirmed_slot['slot_id']}")
-                            # Use the robust database module to save the appointment
-                            success = save_appointment(confirmed_slot["slot_id"])
-                            logger.info(f"save_appointment returned: {success}")
+                            # Wait for the next message with a timeout 
+                            message_json = await asyncio.wait_for(openai_ws.recv(), timeout=60.0) # 60s timeout
+                            response = json.loads(message_json)
+
+                            # Handle user speech transcript delta (Remove potential_date_mentioned logic)
+                            if response.get("type") == "input_audio_buffer.transcript.delta":
+                                user_speech = response.get("transcript", "")
+                                state["user_transcript"] += user_speech
+                                logger.info("User speech transcript delta: %s", user_speech)
                             
+                            # When user finishes speaking, TRANSLATE then process
+                            elif response.get("type") == "input_audio_buffer.transcript.done":
+                                final_user_transcript = state["user_transcript"]
+                                # Log the transcript value BEFORE the check
+                                logger.info(f"Input transcript done event received. Transcript content: '{final_user_transcript}'")
+                                # Simplify condition: Process if transcript is not empty
+                                if final_user_transcript: 
+                                    logger.info("Transcript is non-empty, proceeding with translation for date offering.")
+                                    # --- Translation Step for User Request --- 
+                                    # Use the same function, but we primarily care about the translation here
+                                    extracted_info = await translate_and_extract_appointment_info(final_user_transcript)
+                                    if extracted_info is None:
+                                        logger.error("Translation/Extraction failed for user transcript.")
+                                        # Reset state but don't necessarily error out the whole call yet
+                                        state["last_user_transcript"] = final_user_transcript 
+                                        state["user_transcript"] = ""
+                                        continue 
+                                    
+                                    english_transcript_text = extracted_info.get("translation", "")
+                                    logger.info(f"Translated user transcript (English): {english_transcript_text}")
+                                    
+                                    # --- Offer Matching Slots --- 
+                                    # Call the function dedicated to handling user date requests
+                                    await offer_matching_slots(english_transcript_text, patient_details, openai_ws)
+                                    
+                                    state["last_user_transcript"] = final_user_transcript 
+                                    state["user_transcript"] = ""
+                                else:
+                                     logger.info("User transcript done event: skipping processing (transcript was empty).")
+                                     state["user_transcript"] = "" # Clear buffer anyway
+                                     # Ensure last_user_transcript doesn't get set to empty if it was already empty
+                                     if final_user_transcript: 
+                                         state["last_user_transcript"] = final_user_transcript
+                            
+                            # Handle AI audio response
+                            elif response.get("type") == "response.audio.delta" and "delta" in response:
+                                audio_payload = base64.b64encode(base64.b64decode(response["delta"]) ).decode("utf-8")
+                                await websocket.send_json({"event": "media", "streamSid": state["stream_sid"], "media": {"payload": audio_payload}})
+                                if state["response_start_timestamp_twilio"] is None:
+                                    state["response_start_timestamp_twilio"] = state["latest_media_timestamp"]
+                                if response.get("item_id"):
+                                    state["last_assistant_item"] = response["item_id"]
+                                await send_mark(websocket, state["stream_sid"])
+                            
+                            # Handle AI text transcript
+                            elif response.get("type") == "response.audio_transcript.delta":
+                                transcript_delta = response.get("transcript", "")
+                                state["transcript_buffer"] += transcript_delta
+                                # logger.info("Received AI transcript delta: %s", transcript_delta) # Removed info log
+                            
+                            # Process complete AI transcript
+                            elif response.get("type") == "response.audio_transcript.done":
+                                state["accumulated_text"] = response.get("transcript", state["transcript_buffer"])
+                                logger.info("Full AI transcript accumulated: %s", state["accumulated_text"])
+                                state["transcript_buffer"] = ""
+                                # Check if this AI transcript confirms an appointment
+                                if not state["appointment_confirmed"]:
+                                    await check_for_appointment_confirmation(state["accumulated_text"], patient_details, openai_ws, websocket, state)
+                                
+                                # NOTE: Don't reset accumulated_text here yet
+                            
+                            # Handle AI response completion
+                            elif response.get("type") == "response.done":
+                                # Use the text accumulated during response.audio_transcript.done
+                                full_text = state["accumulated_text"].lower() 
+                                logger.info("AI response text finalized (in response.done): %s", full_text)
+                                
+                                # --- Check for Hangup Trigger AFTER checking confirmation ---
+                                triggered_hangup = False
+                                for phrase in AI_GOODBYE_PHRASES:
+                                    if phrase in full_text:
+                                        logger.info(f"Detected AI goodbye phrase: '{phrase}'. Waiting 5s before triggering call end.")
+                                        await asyncio.sleep(5) # Use 5 seconds
+                                        try:
+                                            if openai_ws.open:
+                                                await openai_ws.close()
+                                                logger.info("Closed OpenAI WebSocket.")
+                                            await websocket.close()
+                                            logger.info("Closed Twilio WebSocket.")
+                                            triggered_hangup = True
+                                            break
+                                        except Exception as close_err:
+                                            logger.error(f"Error closing websockets: {close_err}")
+                                
+                                if triggered_hangup:
+                                    logger.info("Hangup triggered, breaking send_to_twilio loop.")
+                                    break # Exit the while loop
+                                
+                                # Reset accumulated text only if not hanging up
+                                state["accumulated_text"] = ""
+
+                            # Handle user speech detection
+                            elif response.get("type") == "input_audio_buffer.speech_started":
+                                logger.info("User speech detected at timestamp %d", state["latest_media_timestamp"])
+                                if state["last_assistant_item"]:
+                                    await handle_interruption(openai_ws, websocket, state)
+                            
+                            # Handle user speech completion
+                            elif response.get("type") == "input_audio_buffer.speech_finished":
+                                logger.info("User speech finished, processing")
+                                state["is_listening"] = True
+                                
+                        except asyncio.TimeoutError:
+                            logger.debug("OpenAI receive timeout, checking connection.")
+                            if not openai_ws.open:
+                                logger.warning("OpenAI WebSocket closed during timeout check.")
+                                break 
+                            continue # Continue waiting if open
+                        except websockets.exceptions.ConnectionClosedOK:
+                             logger.info("OpenAI WebSocket connection closed normally.")
+                             break 
+                        except websockets.exceptions.ConnectionClosedError as e:
+                             logger.error(f"OpenAI WebSocket connection closed with error: {e}")
+                             break
+                        except Exception as loop_err:
+                             logger.error(f"Error processing message in send_to_twilio loop: {loop_err}")
+                             continue # Continue the loop
+
+                except Exception as e:
+                    logger.error("Error in send_to_twilio outer loop: %s", str(e))
+                    # Ensure websockets are closed on outer exception
+                    try:
+                        if openai_ws.open: await openai_ws.close()
+                        # Checking FastAPI websocket state before close is tricky, attempt close directly
+                        await websocket.close()
+                    except Exception as close_err:
+                         logger.error(f"Error closing websockets during outer exception handling: {close_err}")
+                    # raise # Optionally re-raise
+                finally:
+                    logger.info("send_to_twilio listening loop ended.")
+            
+            async def offer_matching_slots(english_transcript: str, patient_details: dict, openai_ws):
+                 """Processes translated ENGLISH user transcript to find date and offer slots via AI."""
+                 logger.info("--- Starting offer_matching_slots ---")
+                 logger.info(f"Processing English transcript: '{english_transcript}'")
+                 
+                 english_months_pattern = 'January|February|March|April|May|June|July|August|September|October|November|December'
+                 date_patterns = [
+                     # ... (Standard English patterns) ...
+                     rf'(\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:{english_months_pattern})\s+\d{{4}})', 
+                     rf'((?:{english_months_pattern})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}})', 
+                     # ... include other relevant patterns ...
+                     r'(tomorrow)', r'(next\s+week)', # etc.
+                 ]
+                 
+                 extracted_date_str = None
+                 # ... (Loop through patterns to find extracted_date_str) ...
+                 
+                 if not extracted_date_str:
+                     logger.info("No date pattern matched in user request.")
+                     # Optionally send a clarification message back? 
+                     # await send_text(openai_ws, "I didn't catch a specific date, could you please repeat?")                     
+                     logger.info("--- Ending offer_matching_slots (no date pattern match) ---")
+                     return
+                 
+                 date_to_parse = extracted_date_str
+                 try:
+                     # ... (Parse date_to_parse to get parsed_date object) ...
+                     parsed_date = parser.parse(date_to_parse)
+                     normalized_db_date = parsed_date.strftime("%Y-%m-%d")
+                     logger.info(f"Parsed user request date to: {normalized_db_date}")
+                     
+                     all_available_slots = patient_details.get("availability", []) 
+                     slots_on_date = [s for s in all_available_slots if s["date"] == normalized_db_date]
+                     
+                     if slots_on_date:
+                         slot_descriptions = "\n".join([f"- {s['start_time']} to {s['end_time']}" for s in slots_on_date])
+                         offer_message = (
+                             f"Okay, for {normalized_db_date}, I found these available slots:\n{slot_descriptions}\n"
+                             f"Would you like to book the first one at {slots_on_date[0]['start_time']}?"
+                         )
+                         await send_text(openai_ws, offer_message)
+                     else:
+                         if not all_available_slots: 
+                             alternative_msg = f"I'm sorry, we don't have any openings on {normalized_db_date}, and there are currently no available appointment slots in our system at all. Please check back later."
+                         else:
+                             alternative_dates = list(set([s["date"] for s in all_available_slots]))[:3]
+                             alternative_msg = f"I'm sorry, but there are no available slots on {normalized_db_date}. We do have openings on other dates like: {', '.join(alternative_dates)}. Would any of those work?"
+                         await send_text(openai_ws, alternative_msg)
+                 except Exception as e:
+                     logger.error(f"Error parsing user date or finding slots: {e}")
+                     await send_text(openai_ws, "I had trouble understanding that date. Could you please specify it again?")
+                 finally:
+                     logger.info("--- Ending offer_matching_slots ---")
+
+            async def check_for_appointment_confirmation(ai_transcript: str, patient_details: dict, openai_ws, websocket, state):
+                """Processes final AI transcript via LLM, finds slot, and saves."""
+                logger.info(f"Checking final AI transcript for booking confirmation: '{ai_transcript[:100]}...'")
+                
+                # --- Translate and Extract Date/Time using LLM --- 
+                extracted_info = await translate_and_extract_appointment_info(ai_transcript) 
+                if not extracted_info:
+                     logger.error("Translation/extraction of AI transcript failed.")
+                     return
+
+                extracted_date = extracted_info.get("date") # Expects YYYY-MM-DD
+                extracted_time = extracted_info.get("time") # Expects HH:MM:SS
+                logger.info(f"LLM Extraction Result: Date={extracted_date}, Time={extracted_time}")
+
+                # --- Find Slot and Save --- 
+                if extracted_date and extracted_time: 
+                    logger.info("LLM extracted valid date and time. Attempting to find matching slot.")
+                    availability = patient_details.get("availability", [])
+                    found_slot_id = None
+                    for slot in availability:
+                        # Exact match on date and time (HH:MM:SS)
+                        if slot.get('date') == extracted_date and slot.get('start_time') == extracted_time:
+                            found_slot_id = slot.get('slot_id')
+                            logger.info(f"Found matching slot_id: {found_slot_id}")
+                            break
+                    
+                    if found_slot_id:
+                        logger.info(f"Attempting to save appointment for slot_id: {found_slot_id}")
+                        try:
+                            success = save_appointment(found_slot_id)
+                            logger.info(f"save_appointment returned: {success}")
                             if success:
-                                logger.info("Saved appointment for slot ID %s", confirmed_slot["slot_id"])
-                                
-                                # Mark appointment as confirmed
+                                logger.info("Saved appointment for slot ID %s", found_slot_id)
                                 state["appointment_confirmed"] = True
-                                
-                                # Clear pending slot
-                                state["pending_slot"] = None
-                                
-                                # Send confirmation message
-                                await twilio_ws.send_json({
-                                    "event": "media",
-                                    "streamSid": state["stream_sid"],
-                                    "media": {
-                                        "payload": base64.b64encode(
-                                            b"Your appointment has been confirmed and saved to our system. Thank you!"
-                                        ).decode("utf-8")
-                                    }
-                                })
-                                
-                                # Don't stop the call immediately - let the conversation continue naturally
-                                logger.info("Appointment confirmed and saved to database")
                             else:
                                 logger.error("Failed to save appointment (save_appointment returned False)")
-                                await send_text(openai_ws, "I'm having trouble saving your appointment. Let's try again.")
-                                
                         except Exception as e:
                             logger.error("Error calling save_appointment: %s", str(e))
-                            await send_text(openai_ws, "I'm having trouble saving your appointment. Let's try again.")
-                    
-                    # If we don't have a pending slot but found a date in the confirmation
                     else:
-                        logger.info("No pending_slot found. Attempting to extract date from AI confirmation text.")
-                        # Extract date from confirmation
-                        date_pattern = r"""
-                            (\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+to\s+\d{2}:\d{2})|
-                            ([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th),\s+\d{4}\s+from\s+\d{1,2}:\d{2}\s+[APM]{2}\s+to\s+\d{1,2}:\d{2}\s+[APM]{2})|
-                            (\d{4}-\d{2}-\d{2})|
-                            ([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th),\s+\d{4})
-                        """
-                        match = re.search(date_pattern, transcript, re.VERBOSE | re.IGNORECASE)
-                        
-                        if match and state["stream_sid"]:
-                            raw_date = match.group().strip()
-                            logger.info("Extracted raw date from confirmation: %s", raw_date)
-                            try:
-                                date_part = raw_date.split(" from ")[0] if " from " in raw_date else raw_date
-                                dt = parser.parse(date_part)
-                                normalized_date = dt.strftime("%Y-%m-%d")
-                                logger.info("Normalized date: %s", normalized_date)
-                                
-                                # Find matching slot
-                                logger.info("Attempting to find matching slot in availability for extracted date.")
-                                confirmed_slot = next(
-                                    (s for s in patient_details["availability"] if s["date"] == normalized_date),
-                                    None
-                                )
-                                
-                                if confirmed_slot:
-                                    logger.info("Found slot via date extraction: %s", confirmed_slot)
-                                    
-                                    logger.info(f"Calling save_appointment with slot_id: {confirmed_slot['slot_id']}")
-                                    # Use the robust database module to save the appointment
-                                    success = save_appointment(confirmed_slot["slot_id"])
-                                    logger.info(f"save_appointment returned: {success}")
-                                    
-                                    if success:
-                                        logger.info("Saved appointment for slot ID %s", confirmed_slot["slot_id"])
-                                        
-                                        # Mark appointment as confirmed
-                                        state["appointment_confirmed"] = True
-                                        
-                                        await twilio_ws.send_json({
-                                            "event": "media",
-                                            "streamSid": state["stream_sid"],
-                                            "media": {
-                                                "payload": base64.b64encode(
-                                                    b"Your appointment has been confirmed and saved to our system. Thank you!"
-                                                ).decode("utf-8")
-                                            }
-                                        })
-                                        
-                                        # Don't stop the call immediately - let the conversation continue naturally
-                                        logger.info("Appointment confirmed and saved to database")
-                                    else:
-                                        logger.error("Failed to save appointment via date extraction (save_appointment returned False)")
-                                        await send_text(openai_ws, "I'm having trouble saving your appointment. Let's try again.")
-                                else:
-                                    logger.warning("No slot found for extracted date %s", normalized_date)
-                                    await send_text(openai_ws, "I'm sorry, but I couldn't find that slot in our system. Let's try again with a different date.")
-                            except Exception as e:
-                                logger.error("Date parsing/extraction error: %s", str(e))
-                                await send_text(openai_ws, "I'm having trouble processing that date. Could you please specify another date?")
+                         logger.warning(f"LLM extracted date/time '{extracted_date} {extracted_time}', but no matching available slot found.")
                 else:
-                    logger.info("No scheduling confirmation phrases found in AI transcript.")
+                    logger.info("LLM did not extract a confirmable date/time from this AI transcript.")
             
             async def handle_interruption(openai_ws, twilio_ws, state):
                 if state["mark_queue"] and state["response_start_timestamp_twilio"] is not None:
