@@ -66,7 +66,7 @@ Example Output: {{"translation": "We have April 30th available at 3pm.", "date":
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=prompt_messages,
-            temperature=0.1,
+            temperature=0.3,
             response_format={"type": "json_object"} # Request JSON output
         )
         content = response.choices[0].message.content
@@ -97,7 +97,8 @@ Example Output: {{"translation": "We have April 30th available at 3pm.", "date":
         logger.error(f"Error during OpenAI extraction API call: {e}", exc_info=True)
         return None
 
-async def initialize_openai_session(openai_ws, db_conn):
+async def initialize_openai_session_outbound(openai_ws, db_conn):
+    """Initializes the OpenAI session specifically for outbound appointment scheduling calls."""
     session_update = {
         "type": "session.update",
         "session": {
@@ -168,6 +169,59 @@ async def initialize_openai_session(openai_ws, db_conn):
     await send_initial_conversation_item(openai_ws, patient_details)
     return patient_details
 
+async def initialize_openai_session_inbound(openai_ws):
+    """Initializes the OpenAI session specifically for inbound/general inquiry calls."""
+    session_update = {
+        "type": "session.update",
+        "session": {
+            "turn_detection": { 
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 600
+            },
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "voice": "alloy",
+            "instructions": (
+                "You are AI Dental Assistant OnasiHelper for Allballa Dental Center handling INBOUND calls. "
+                "**ULTRA-CRITICAL INSTRUCTIONS - FOLLOW THESE RULES PRECISELY AND WITHOUT FAIL:**\n"
+                "1. **INITIAL GREETING ONLY:** Your VERY FIRST and ONLY initial action is to say **EXACTLY** this phrase once: 'Thank you for calling Alballa Dental Center! This is AI Dental Assistant OnasiHelper. How can I help you today?' \n"
+                "2. **ABSOLUTE SILENCE AFTER GREETING:** After saying the initial greeting (Step 1), you **MUST STOP SPEAKING**. Remain completely silent. Do NOT say anything else. Your microphone is effectively off until the caller speaks.\n"
+                "3. **REACT ONLY TO CALLER SPEECH:** Your ONLY trigger to speak again after the initial greeting is detecting actual speech from the caller. Do NOT react to silence, background noise, or internal timers.\n"
+                "4. **RESPONSE TO VAGUE GREETINGS:** If the caller's first speech is a simple greeting like 'hello', 'hi', or similar, respond **ONCE** with **EXACTLY**: 'Hello! You have reached AlBalla Dental Center, how can I help you today?' Then STOP SPEAKING and wait for their specific request.\n"
+                "5. **NO REPEATED INTRODUCTIONS:** **NEVER** repeat your name or role ('OnasiHelper', 'AI Dental Assistant') after the initial greeting (Step 1) unless the caller explicitly asks 'Who am I speaking with?' or similar. Do NOT say 'again'.\n"
+                "6. **HANDLE SPECIFIC QUERIES:** If the caller asks a specific question, answer it concisely and directly. Then STOP SPEAKING and wait.\n"
+                "7. **NO UNPROMPTED TALKING:** Do not fill silence. Do not make assumptions. Do not offer information not asked for. Do not ask follow-up questions unless necessary to clarify their request.\n"
+                "8. **NO PREMATURE GOODBYE:** Do not say goodbye unless the caller says goodbye first.\n"
+            ),
+            "modalities": ["text", "audio"],
+            "temperature": 0.7 # Lowered temperature
+        }
+    }
+    logger.info("Sending session update for INBOUND call: %s", json.dumps(session_update))
+    print("Sending INBOUND session update")
+    await openai_ws.send(json.dumps(session_update))
+
+    # Send the initial greeting for inbound calls
+    greeting_message = {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Thank you for calling Alballa Dental Center! This is AI Dental Assistant OnasiHelper. How can I help you today?"}]
+        }
+    }
+    await openai_ws.send(json.dumps(greeting_message))
+    logger.info("Sent inbound initial greeting message")
+    print("Inbound initial greeting message sent")
+
+    # Now, just wait for actual user input after sending the greeting.
+    logger.info("Waiting for user speech input after greeting.")
+    print("Waiting for user speech input after greeting.")
+
+    # No patient details needed/returned for this simple inbound case yet
+
 async def send_initial_conversation_item(openai_ws, patient_details):
     current_date_obj = datetime.now()
     current_date_str = current_date_obj.strftime("%B %d, %Y")
@@ -221,7 +275,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         "item": {
             "type": "message",
             "role": "system",
-            "content": [{"type": "input_text", "text": system_message_text}]
+            "content": [{"type": "text", "text": system_message_text}]
         }
     }
     await openai_ws.send(json.dumps(system_message_item))
@@ -253,7 +307,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         "item": {
             "type": "message",
             "role": "assistant",
-            "content": [{"type": "input_text", "text": initial_text}]
+            "content": [{"type": "text", "text": initial_text}]
         }
     }
     await openai_ws.send(json.dumps(initial_conversation_item))

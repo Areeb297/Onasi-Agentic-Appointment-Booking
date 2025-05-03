@@ -2,7 +2,7 @@
 
 ## Overview
 
-The **Dental Scheduler Voice Agent** is an AI-powered application designed to automate appointment scheduling for Allballa Dental Center. Built with **FastAPI**, **Twilio**, **OpenAI Realtime API**, and **SQL Server**, it handles incoming and outgoing calls, processes natural language to schedule appointments, and integrates with a robust database for reliable transaction management. The agent uses voice interactions to greet patients, retrieve available slots, confirm appointments, and save bookings to the database.
+The **Dental Scheduler Voice Agent** is an AI-powered application designed to automate appointment scheduling for Allballa Dental Center. Built with **FastAPI**, **Twilio**, **OpenAI Realtime API**, and **SQL Server**, it handles incoming and outgoing calls, processes natural language to schedule appointments, and integrates with a robust database for reliable transaction management. The agent uses voice interactions to greet patients, retrieve available slots, confirm appointments, and save bookings to the database. Here outbound calls means our app calling the patient & inbound means incoming calls (someone calling the patient from our Twilio number)
 
 Key features:
 - **Voice Interaction**: Handles real-time voice conversations using Twilio's media streaming and OpenAI's Realtime API.
@@ -162,7 +162,8 @@ dental-scheduler-voice-agent/
 ├── main.py                 # FastAPI application entry point
 ├── models.py               # Defines patient data model
 ├── openai_handler.py       # Handles OpenAI Realtime API interactions
-├── twilio_handler.py       # Manages Twilio call handling and WebSocket
+├── twilio_inbound_handler.py   # NEW: Manages INBOUND Twilio calls & WebSocket
+├── twilio_outbound_handler.py  # NEW: Manages OUTBOUND Twilio calls & WebSocket
 ├── example.env             # Example environment configuration
 ├── confirmation_debug.log  # Debug log for appointment confirmations
 ├── requirements.txt        # Python dependencies (create this file)
