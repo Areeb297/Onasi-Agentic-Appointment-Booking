@@ -234,6 +234,9 @@ async def send_initial_conversation_item(openai_ws, patient_details):
     if not patient_details["availability"]:
          formatted_availability = "None"
 
+    # Log the formatted_availability for debugging
+    logger.info(f"Formatted availability: {formatted_availability}")
+
     # Update system message instructions
     system_message_text = (
         "You are a helpful AI receptionist working at Allballa Dental Center. "
@@ -243,7 +246,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         "{history_context}I'm reaching out regarding {action}. Your next follow-up appointment is due, "
         "and I'd like to schedule it for you. Do you have a preferred date and time?'. "
         "Always follow the center's protocols and provide accurate scheduling information."
-        f"Today's date is {current_date_str}. The list below contains **only future** available appointment slots relative to today:\n{{formatted_availability}}\n" # Emphasize future dates
+        f"Today's date is {current_date_str}. The list below contains **only future** available appointment slots relative to today:\n{formatted_availability}\n" # Use the correctly formatted string here
         "If the list is empty (shows 'None'), you MUST inform the user no slots are available.\n"
         "When asked about dates like 'next week', calculate relative to today ({current_date_str}) and check against the future slots provided.\n"
         "1. Acknowledge the patient's preference\n"
@@ -265,7 +268,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         name=name, 
         history_context=history_context, 
         action=action,
-        formatted_availability=formatted_availability, # Use the potentially filtered string
+        formatted_availability=formatted_availability, # Pass the variable here
         current_date_str=current_date_str, # Pass string version
         current_time=current_time_str # Pass string version
     )
@@ -279,7 +282,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         }
     }
     await openai_ws.send(json.dumps(system_message_item))
-    logger.info("Sent system message")
+    logger.info("Sent system message with updated instructions")
     print("System message sent")
     
     # Construct and send the FULL initial greeting text directly
@@ -289,7 +292,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         f"{history_context}"
         f"I'm reaching out regarding {action}. "
         f"Your next follow-up appointment is due, and I'd like to schedule it for you. "
-        f"Today's date is {current_date_str}. The list below contains **only future** available appointment slots relative to today:\n{{formatted_availability}}\n"
+        f"Today's date is {current_date_str}. The list below contains **only future** available appointment slots relative to today:\n{formatted_availability}\n" # Corrected: Use single braces
         f"If the list is empty (shows 'None'), you MUST inform the user no slots are available.\n"
         f"When asked about dates like 'next week', calculate relative to today ({current_date_str}) and check against the future slots provided.\n"
         f"1. Acknowledge the patient's preference\n"
@@ -302,6 +305,9 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         f"8. Use the exact booking confirmation phrases when an appointment is confirmed\n"
     )
 
+    # Log the initial_text for debugging (truncated)
+    logger.info(f"Initial greeting text (first 500 chars): {initial_text[:500]}...")
+
     initial_conversation_item = {
         "type": "conversation.item.create",
         "item": {
@@ -311,7 +317,7 @@ async def send_initial_conversation_item(openai_ws, patient_details):
         }
     }
     await openai_ws.send(json.dumps(initial_conversation_item))
-    logger.info("Sent initial greeting message content")
+    logger.info("Sent initial greeting message content with correct availability")
     print("Initial greeting message content sent")
     
     # Ensure response.create is NOT commented out

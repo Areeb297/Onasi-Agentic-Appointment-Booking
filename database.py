@@ -130,7 +130,7 @@ def get_patient_by_id(conn, patient_id):
             logger.info(f"No patient found with ID {patient_id}")
             return None
 
-        # Get available slots with explicit schema reference
+        # Get available slots for DocID = 1 with explicit schema reference
         slots_query = """
         SELECT 
             Id,
@@ -139,20 +139,36 @@ def get_patient_by_id(conn, patient_id):
             CONVERT(varchar, SlotEnd, 108) AS EndTime,
             Status
         FROM [Agentic AI Scheduling].[dbo].[DoctorSlots]
-        WHERE Status = 'Available'
+        WHERE Status = 'Available' AND DocID = ? 
         """
-        cursor.execute(slots_query)
+        cursor.execute(slots_query, (1,))  # Filter by DocID = 1
+        slots = cursor.fetchall()
         
         availability = []
-        for row in cursor.fetchall():
-            availability.append({
-                "slot_id": row.Id,
-                "date": row.Date,
-                "start_time": row.StartTime.split('.')[0],
-                "end_time": row.EndTime.split('.')[0],
-                "status": row.Status,
-                "display": f"{row.Date} {row.StartTime.split('.')[0]} to {row.EndTime.split('.')[0]}"
-            })
+        for row in slots:
+            # Ensure date and time formats are clean and match expectations
+            clean_date = row.Date.strip() if row.Date else None
+            clean_start_time = row.StartTime.split('.')[0].strip() if row.StartTime else None
+            clean_end_time = row.EndTime.split('.')[0].strip() if row.EndTime else None
+            
+            if clean_date and clean_start_time and clean_end_time: # Only add if valid data exists
+                availability.append({
+                    "slot_id": row.Id,
+                    "date": clean_date,
+                    "start_time": clean_start_time,
+                    "end_time": clean_end_time,
+                    "status": row.Status,
+                    "display": f"{clean_date} {clean_start_time} to {clean_end_time}"
+                })
+
+        # Log the retrieved slots for debugging BEFORE returning
+        logger.info(f"Retrieved {len(availability)} available slots for DocID=1:")
+        if availability:
+            for slot in availability:
+                 logger.info(f"  - Slot ID={slot.get('slot_id', 'N/A')}, Date={slot.get('date', 'N/A')}, Start={slot.get('start_time', 'N/A')}, End={slot.get('end_time', 'N/A')}, Status={slot.get('status', 'N/A')}")
+        else:
+            logger.info("  - No available slots found matching the criteria.")
+
 
         patient_details = {
             "id": str(patient_row.Id),
@@ -161,14 +177,15 @@ def get_patient_by_id(conn, patient_id):
             "action": patient_row.Action,
             "medical_history": patient_row.MedicalHistory,
             "comments": patient_row.Comments,
-            "availability": availability
+            "availability": availability # Use the filtered and logged list
         }
-        logger.info(f"Retrieved data for patient ID {patient_id} with {len(availability)} available slots")
+        # Log the final count again just before returning
+        logger.info(f"Returning patient details for ID {patient_id} including {len(availability)} available slots.")
         return patient_details
     
     except pyodbc.Error as e:
-        logger.error(f"Database error in get_patient_by_id: {str(e)}")
-        raise
+        logger.error(f"Database error in get_patient_by_id for patient {patient_id}: {str(e)}")
+        raise # Re-raise the exception after logging
 
 def _save_appointment_internal(conn, slot_id):
     """

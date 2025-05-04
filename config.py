@@ -33,7 +33,7 @@ def load_clean_config():
     config["TWILIO_AUTH_TOKEN"] = os.getenv("TWILIO_AUTH_TOKEN")
     config["TWILIO_PHONE_NUMBER"] = os.getenv("TWILIO_PHONE_NUMBER")
     config["YOUR_PHONE_NUMBER"] = os.getenv("YOUR_PHONE_NUMBER")
-    config["HOSTNAME"] = os.getenv("HOSTNAME")
+    config["NGROK_HOSTNAME"] = os.getenv("NGROK_HOSTNAME")
     config["PORT"] = int(os.getenv("PORT", 5050))
     
     # Log configuration (without sensitive values)
@@ -42,7 +42,7 @@ def load_clean_config():
     logger.info(f"Database Server: {config['SQL_SERVER_SERVER']}")
     logger.info(f"Database Name: {config['SQL_SERVER_DATABASE']}")
     logger.info(f"Trusted Connection: {config['SQL_SERVER_TRUSTED_CONNECTION']}")
-    logger.info(f"Hostname: {config['HOSTNAME']}")
+    logger.info(f"Ngrok Hostname: {config.get('NGROK_HOSTNAME')}")
     logger.info(f"Port: {config['PORT']}")
     
     return config
