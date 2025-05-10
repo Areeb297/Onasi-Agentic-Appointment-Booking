@@ -14,7 +14,7 @@ import re
 import websockets
 from fastapi import WebSocket, Request
 from fastapi.responses import HTMLResponse
-from fastapi.websockets import WebSocketDisconnect
+from fastapi.websockets import WebSocketDisconnect, WebSocketState
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from dateutil import parser
@@ -23,6 +23,10 @@ import logging
 from config import load_clean_config
 from database import save_appointment, get_connection, get_patient_by_id
 from openai_handler import initialize_openai_session_outbound, translate_and_extract_appointment_info
+from openai_handler import client as openai_api_client
+import requests # For downloading Twilio recording
+import time # For polling delays
+import os # For file operations like removing audio file
 
 logger = logging.getLogger(__name__)
 config = load_clean_config()
@@ -70,7 +74,8 @@ async def handle_media_stream(websocket: WebSocket):
         "user_transcript": "",
         "last_user_transcript": "",
         "appointment_confirmed": False,
-        "is_outbound": False  # Assume inbound unless specified
+        "is_outbound": False,
+        "call_sid": None
     }
     
     # Get a connection for initial patient data loading
@@ -109,6 +114,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 "type": "input_audio_buffer.append",
                                 "audio": audio_payload
                             }
+                            logger.debug("Prepared audio_append for OpenAI: %s", json.dumps(audio_append).encode('utf-8')[:100])
                             await openai_ws.send(json.dumps(audio_append))
                             state["audio_chunk_count"] += 1
                             if state["audio_chunk_count"] % 50 == 0:
@@ -116,7 +122,9 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         elif data["event"] == "start":
                             state["stream_sid"] = data["start"]["streamSid"]
-                            logger.info("Twilio stream started: %s", state["stream_sid"])
+                            # Capture callSid if present (Twilio sends it here)
+                            state["call_sid"] = data["start"].get("callSid") 
+                            logger.info("Twilio stream started: %s (callSid: %s)", state["stream_sid"], state["call_sid"])
                             # Optionally detect call direction from Twilio data
                             # For simplicity, rely on initialization context
                         
@@ -419,11 +427,164 @@ async def handle_media_stream(websocket: WebSocket):
 
             logger.info("Starting Twilio-OpenAI streaming for call")
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
-            logger.info("Streaming completed")
-    
+            logger.info("Streaming completed. Proceeding to call recording and transcription.")
+
+    except WebSocketDisconnect:
+        logger.info(f"Twilio WebSocket disconnected for stream_sid: {state.get('stream_sid')}, call_sid: {state.get('call_sid')}. Proceeding to final cleanup and transcription.")
     except Exception as e:
-        logger.error("Media stream handler failed: %s", str(e))
-        raise
+        logger.error(f"Media stream handler failed for call_sid {state.get('call_sid')}: {str(e)}", exc_info=True)
+        # Optionally re-raise if you want the main FastAPI error handling to catch it
+        # raise
+    finally:
+        logger.info(f"Entering finally block for call_sid: {state.get('call_sid')}. Cleaning up and attempting transcription.")
+        # Ensure OpenAI WebSocket is closed if it was opened and is still open
+        # This check needs to be more robust if openai_ws is not always defined in this scope
+        # For now, assuming it might exist from the try block context if connection was successful.
+        # A better pattern would be to initialize openai_ws = None before the try block.
+        # However, the original structure has it inside the try-with-resources for websockets.connect.
+        # Let's focus on the transcription logic placement first.
+
+        call_sid_for_processing = state.get("call_sid")
+        if call_sid_for_processing:
+            logger.info(f"Post-call processing in finally: Downloading recording and transcribing for call SID {call_sid_for_processing}...")
+            try:
+                # Ensure twilio_client is accessible here or passed appropriately
+                audio_path = await download_twilio_recording(call_sid_for_processing, twilio_client, config)
+                
+                if audio_path:
+                    logger.info(f"Recording downloaded: {audio_path}")
+                    # Ensure openai_api_client is accessible here
+                    txt_path, json_path = await transcribe_audio_with_whisper(audio_path, call_sid_for_processing, openai_api_client)
+                    logger.info(f"Transcript saved as {txt_path} and {json_path}")
+                    
+                    # Clean up the audio file
+                    try:
+                        await asyncio.to_thread(os.remove, audio_path)
+                        logger.info(f"Deleted local audio file: {audio_path}")
+                    except Exception as rm_err:
+                        logger.error(f"Error cleaning up audio file {audio_path}: {rm_err}")
+                else:
+                    logger.error(f"Failed to download audio for call {call_sid_for_processing}. Skipping transcription.")
+            except Exception as e:
+                logger.error(f"Post-call recording/transcription in finally block failed for {call_sid_for_processing}: {e}", exc_info=True)
+        else:
+            logger.warning("No call_sid found in state within finally block. Cannot process recording for transcription.")
+        
+        # Ensure the Twilio WebSocket is closed if it's still open
+        # This is tricky because the original error might be that it's *already* closed or not properly accepted.
+        # A simple close attempt might also error. Consider adding a check for websocket.client_state.
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                logger.info(f"Attempting to close Twilio WebSocket in finally block for call_sid: {state.get('call_sid')}")
+                await websocket.close()
+                logger.info(f"Twilio WebSocket successfully closed in finally block for call_sid: {state.get('call_sid')}.")
+            else:
+                logger.info(f"Twilio WebSocket already in state {websocket.client_state.name} for call_sid: {state.get('call_sid')}. No explicit close needed here.")
+        except RuntimeError as re:
+            if "Cannot call \"send\" once a close message has been sent" in str(re) or \
+               "WebSocket is not connected" in str(re): # Covering both common benign messages
+                logger.info(f"Twilio WebSocket already closed or in an unsendable state for call_sid {state.get('call_sid')}: {str(re)}")
+            else:
+                # Log other RuntimeErrors as actual errors
+                logger.error(f"RuntimeError closing Twilio WebSocket in finally block for call_sid {state.get('call_sid')}: {str(re)}", exc_info=True)
+        except Exception as close_err:
+            logger.error(f"Generic error closing Twilio WebSocket in finally block for call_sid {state.get('call_sid')}: {str(close_err)}", exc_info=True)
+
+        logger.info(f"handle_media_stream finished for call_sid: {state.get('call_sid')}.")
+
+# Helper functions for call recording and transcription
+
+async def download_twilio_recording(call_sid, twilio_client_instance, app_config, max_wait_sec=120):
+    """Polls Twilio for a recording for the given call SID, downloads WAV locally, returns filename."""
+    logger.info(f"Polling Twilio for recording for call_sid: {call_sid}...")
+    account_sid = app_config["TWILIO_ACCOUNT_SID"]
+    auth_token = app_config["TWILIO_AUTH_TOKEN"]
+    audio_filename = f"call_audio_{call_sid}.wav"
+
+    for _ in range(int(max_wait_sec // 5)):
+        try:
+            recordings = twilio_client_instance.recordings.list(call_sid=call_sid, limit=1)
+            if recordings:
+                rec = recordings[0]
+                # Ensure recording is in a final state if possible, though Twilio usually makes it available quickly.
+                # rec.status like 'completed', 'processed' or similar could be checked if issues arise.
+                
+                recording_uri = f"/2010-04-01/Accounts/{account_sid}/Recordings/{rec.sid}.wav"
+                full_url = f"https://api.twilio.com{recording_uri}"
+                
+                logger.info(f"Found recording SID: {rec.sid} for call {call_sid}. Attempting download from {full_url}")
+                
+                # Run synchronous requests call in a separate thread
+                response_content = await asyncio.to_thread(
+                    requests.get, full_url, auth=(account_sid, auth_token)
+                )
+                
+                if response_content.status_code == 200:
+                    with open(audio_filename, "wb") as f:
+                        f.write(response_content.content)
+                    logger.info(f"Recording for call {call_sid} downloaded to {audio_filename}")
+                    return audio_filename
+                else:
+                    logger.error(f"Failed to download recording {rec.sid} for call {call_sid}. Status: {response_content.status_code}, Response: {response_content.text[:200]}")
+            else:
+                logger.info(f"No recording found yet for call {call_sid} on attempt. Waiting...")
+        except Exception as e:
+            logger.error(f"Error polling or downloading recording for {call_sid}: {e}", exc_info=True)
+
+        await asyncio.sleep(5) # Wait 5 seconds before next poll
+        
+    logger.error(f"Recording not found or downloaded for call {call_sid} after {max_wait_sec} seconds.")
+    return None
+
+async def transcribe_audio_with_whisper(audio_path, call_sid, openai_client_instance):
+    """Sends audio to OpenAI Whisper, saves transcript as .txt and .json."""
+    if not audio_path or not openai_client_instance:
+        logger.error(f"No audio path ({audio_path}) or OpenAI client provided for transcription for call {call_sid}.")
+        return None, None
+
+    logger.info(f"Transcribing audio file: {audio_path} for call {call_sid} using Whisper.")
+    transcript_json_filename = f"transcript_{call_sid}.json"
+    transcript_text_filename = f"transcript_{call_sid}.txt"
+
+    try:
+        with open(audio_path, "rb") as audio_file:
+            # Run the synchronous OpenAI SDK call in a separate thread
+            transcript_obj = await asyncio.to_thread(
+                openai_client_instance.audio.transcriptions.create,
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json" # Request verbose JSON for more details
+            )
+        
+        # Extract text, robustly handling if transcript_obj is a dict or an object
+        if hasattr(transcript_obj, 'text'):
+            full_transcript_text = transcript_obj.text
+        elif isinstance(transcript_obj, dict) and 'text' in transcript_obj:
+            full_transcript_text = transcript_obj.get('text', "")
+        else: # Fallback if structure is unexpected
+            logger.warning(f"Unexpected transcript object structure for call {call_sid}. Trying to convert to string.")
+            full_transcript_text = str(transcript_obj)
+
+        logger.info(f"Whisper transcription successful for {call_sid}. Text length: {len(full_transcript_text)}")
+
+        # Save as .txt
+        with open(transcript_text_filename, "w", encoding="utf-8") as f:
+            f.write(full_transcript_text)
+        logger.info(f"Plain text transcript saved to: {transcript_text_filename}")
+
+        # Save the full transcript object (verbose_json) as .json
+        with open(transcript_json_filename, "w", encoding="utf-8") as f:
+            # If transcript_obj is not a Pydantic model but a dict (older SDK versions might return dicts)
+            if isinstance(transcript_obj, dict):
+                 json.dump(transcript_obj, f, ensure_ascii=False, indent=2)
+            else: # Assuming it's a Pydantic model with a model_dump method (newer SDK versions)
+                 json.dump(transcript_obj.model_dump(), f, ensure_ascii=False, indent=2)
+        logger.info(f"JSON transcript saved to: {transcript_json_filename}")
+        return transcript_text_filename, transcript_json_filename
+
+    except Exception as e:
+        logger.error(f"Error during Whisper transcription for {audio_path} (call {call_sid}): {e}", exc_info=True)
+        return None, None
 
 async def trigger_call():
     logger.info("Using TWILIO_ACCOUNT_SID: %s", config["TWILIO_ACCOUNT_SID"])
@@ -441,7 +602,8 @@ async def trigger_call():
     call = twilio_client.calls.create(
         url=call_twiml_url,
         to=config["YOUR_PHONE_NUMBER"],
-        from_=config["TWILIO_PHONE_NUMBER"]
+        from_=config["TWILIO_PHONE_NUMBER"],
+        record=True # Enable Twilio call recording
     )
     logger.info("Initiated outbound call (%s) pointing to TwiML URL: %s", call.sid, call_twiml_url)
     return {"status": "Call initiated!", "call_sid": call.sid}

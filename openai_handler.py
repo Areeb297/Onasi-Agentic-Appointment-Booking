@@ -66,7 +66,7 @@ Example Output: {{"translation": "We have April 30th available at 3pm.", "date":
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=prompt_messages,
-            temperature=0.3,
+            temperature=0.4,
             response_format={"type": "json_object"} # Request JSON output
         )
         content = response.choices[0].message.content
